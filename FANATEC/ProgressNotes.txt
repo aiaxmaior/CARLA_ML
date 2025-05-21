@@ -1,0 +1,18 @@
+- Install **FanaLab** not just the driver. Pygame will not recognize the fanatec hardware otherwise.
+- Installed Miniconda (fanatec environment)
+- (pypi) *carla* package requires python==3.8 
+    #(conda create -n fanatec python==3.8)
+- Packages (specific): pygame, numpy / scikit-learn
+
+
+
+
+
+
+Questions:
+- CARLA UE4 vs UE5
+    # UE5 has AI-integration, updated python packages, better graphics and physics rendering
+- Gfx requirements
+    # Integration of AI vs graphics rendering
+- Cloud or local AI (nemotron) model?
+    # Which model to run?

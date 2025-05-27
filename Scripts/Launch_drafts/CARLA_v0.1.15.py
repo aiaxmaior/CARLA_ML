@@ -31,15 +31,17 @@ from __future__ import print_function
 import glob
 import os
 import sys
-"""
-try:
-    sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg')
-        sys.version_info.major,
-        sys.version_info.minor,
-        'win-amd64' if os.name == 'nt' else 'linux-x86_64')[0]
-except IndexError:
-    pass
-"""
+import subprocess # ADDED: For launching CARLA server
+import time       # ADDED: For delays
+
+# try: # Original CARLA path appending - typically handled by CARLA_PATH environment variable
+#     sys.path.append(glob.glob('../carla/dist/carla-*%d.%d-%s.egg')
+#         sys.version_info.major,
+#         sys.version_info.minor,
+#         'win-amd64' if os.name == 'nt' else 'linux-x86_64')[0]
+# except IndexError:
+#     pass
+
 import carla
 #
 from carla import ColorConverter as cc
@@ -90,6 +92,9 @@ try:
     import numpy as np
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
+
+# Global variable to hold the CARLA server process
+carla_server_process = None
 
 # +------------------------------------------------------------------------------+
 # | Global Functions                                                             |
@@ -157,6 +162,7 @@ class World(object):
             self.player.set_autopilot(False)
 
         # Set up the sensors.
+        # MODIFIED: Pass self.hud.critical_alert and self.hud.notification methods to sensors if they use them directly
         self.collision_sensor = CollisionSensor(self.player, self.hud)
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
@@ -164,7 +170,7 @@ class World(object):
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
-        self.hud.notification(actor_type)
+        self.hud.notification(actor_type, seconds = 2.0) #Informational : actor type spawned
 
     def next_weather(self, reverse=False):
         self._weather_index += -1 if reverse else 1
@@ -179,19 +185,13 @@ class World(object):
         if self.player is not None and isinstance(self.player, carla.Vehicle):
             spectator = self.world.get_spectator()
             vehicle_transform = self.player.get_transform()
-            # Get specific vehicle physics information IN CONSTOL
             
-            #print("Vehicle Transform Rotation:", vehicle_transform.rotation)
-            # Define an offset for the driver's eye point (adjust these values as needed)
             driver_seat_offset_location = carla.Location(x=0.8, y=0.0, z=1.6)
-            # Apply the vehicle's rotation to the offset vector using transform_vector
             rotated_offset = vehicle_transform.transform_vector(driver_seat_offset_location)
-            # Add the rotated offset vector to the vehicle's world location
             spectator_location = vehicle_transform.location + rotated_offset
-            # Create the spectator transform using the new location and the vehicle's rotation
             spectator_transform = carla.Transform(spectator_location, vehicle_transform.rotation)
-            print(f"Vehicle Transform Rotation:, {vehicle_transform.rotation}, Vehicle Transform Location Debug info:, {vehicle_transform.location}, Spectator Offset Location {spectator_transform.location}")
-            # Set the spectator's transform
+            # Removed print statement for debug
+            # print(f"Vehicle Transform Rotation:, {vehicle_transform.rotation}, Vehicle Transform Location Debug info:, {vehicle_transform.location}, Spectator Offset Location {spectator_transform.location}") 
             spectator.set_transform(spectator_transform)
 
     def render(self, display):
@@ -355,25 +355,28 @@ class DualControl(object):
                         self._control.hand_brake = not self._control.hand_brake
                         world.hud.notification('Handbrake %s' % ('On' if self._control.hand_brake else 'Off'))
 
-                    # Reverse button (toggle gear between 1 and -1)
+                    # MODIFIED: More robust reverse gear toggle logic
                     if event.joy == self._steer_joystick_idx and event.button == self._reverse_button_idx:
-                        self._control.gear = 1 if self._control.gear else -1
-                        self._control.reverse = self._control.gear < 0
-                        world.hud.notification('Gear: %s' % {-1: 'R', 1: 'D'}.get(self._control.gear, self._control.gear))
+                        # Toggle between Reverse (-1) and Drive (1) or Neutral (0)
+                        if self._control.gear == -1: # If currently in reverse, switch to 1st gear (or neutral if stopped)
+                            self._control.gear = 1 if world.player.get_velocity().length() > 0.1 else 0 # Go to 1st if moving, else Neutral
+                            self._control.reverse = False
+                            world.hud.notification('Gear: D' if self._control.gear == 1 else 'Gear: N')
+                        else: # If not in reverse, switch to reverse
+                            self._control.gear = -1
+                            self._control.reverse = True
+                            world.hud.notification('Gear: R')
 
                     # Manual Gear Shift (Toggle manual mode)
-                    # You might map this to a button or use the 'm' key as in original
                     if event.joy == self._steer_joystick_idx and event.button == self._gear_mode_manual:
                         self._control.manual_gear_shift = not self._control.manual_gear_shift
                         self._control.gear = world.player.get_control().gear # Sync gear display
                         world.hud.notification('%s Transmission' % ('Manual' if self._control.manual_gear_shift else 'Automatic'))
 
-
                     # Gear Up (if in manual mode)
-                    if self._gear_mode_manual and event.joy == self._steer_joystick_idx and event.button == self._gear_up_button_idx:
+                    if self._control.manual_gear_shift and event.joy == self._steer_joystick_idx and event.button == self._gear_up_button_idx:
                         self._control.gear = self._control.gear + 1
                         world.hud.notification('Gear: %s' % self._control.gear)
-
 
                     # Gear Down (if in manual mode)
                     if self._control.manual_gear_shift and event.joy == self._steer_joystick_idx and event.button == self._gear_down_button_idx:
@@ -477,10 +480,8 @@ class DualControl(object):
         return (key == K_ESCAPE) or (key == K_q and pygame.key.get_mods() & KMOD_CTRL)
 
 # +------------------------------------------------------------------------------+
-# | HUD Class                                                                    |
+# | HUD Class (MODIFIED)                                                         |
 # +------------------------------------------------------------------------------+
-
-
 
 class HUD(object):
     def __init__(self, width, height):
@@ -492,13 +493,28 @@ class HUD(object):
         mono = default_font if default_font in fonts else fonts[0]
         mono = pygame.font.match_font(mono)
         self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
-        
-        #Calculate centre position for notification text
-        notification_width = width #Assuming notification surface is full width for now
-        notification_height = 40 #Based on original definition
+
+        # Load the alert sound (Optional, ensure 'alert_sound.wav' exists or remove)
+        try:
+            pygame.mixer.init() # Initialize mixer
+            self.alert_sound = pygame.mixer.Sound('alert_sound.wav')
+            self.alert_sound.set_volume(0.5) # Optional: Adjust volume (0.0 to 1.0)
+        except pygame.error as e:
+            print(f"Warning: Could not load alert sound: {e}. Ensure pygame.mixer is initialized and file exists.")
+            self.alert_sound = None
+
+        # Calculate centre position for BLINKING MIDDLE notification
+        # This will be passed as the initial_pos to BlinkingAlert
+        notification_width = width # Full width for the blinking alert
+        notification_height = 80 # Taller for a bigger, central alert
         center_x = (width - notification_width) // 2
         center_y = (height - notification_height) // 2
-        self._notifications = FadingText(font, (notification_width, notification_height), (center_x, center_y))
+        # Use BlinkingAlert for critical pop-up messages
+        self._blinking_alert = BlinkingAlert(font, (notification_width, notification_height), (center_x, center_y))
+
+        # Initialize Persistent Warning (for top-right)
+        self._persistent_warning = PersistentWarning(self._font_mono, self.dim, (0,0))
+
         self.help = HelpText(pygame.font.Font(mono, 24), width, height)
         self.server_fps = 0
         self.frame = 0
@@ -507,6 +523,12 @@ class HUD(object):
         self._info_text = []
         self._server_clock = pygame.time.Clock()
 
+        # Track last *count* a warning was issued to prevent continuous re-triggering for ongoing events
+        self._last_collision_count_warned = 0
+        self._last_lane_invasion_count_warned = 0
+        self._last_speed_warning_frame_warned = -1
+        self._last_lane_invasion_frame_warned = -1 # Cooldown for lane invasion notification
+
     def on_world_tick(self, timestamp):
         self._server_clock.tick()
         self.server_fps = self._server_clock.get_fps()
@@ -514,72 +536,105 @@ class HUD(object):
         self.simulation_time = timestamp.elapsed_seconds
 
     def tick(self, world, clock):
-        self._notifications.tick(world, clock)
+        # Tick custom HUD elements
+        self._blinking_alert.tick(world, clock)
+        self._persistent_warning.tick(world, clock) # Persistent warning does little in its tick, but it's consistent
+
         if not self._show_info:
             return
+        
+        # Original code had t, v, c and related info display. We rebuild it here.
         t = world.player.get_transform()
         v = world.player.get_velocity()
         c = world.player.get_control()
-        heading = 'N' if abs(t.rotation.yaw) < 89.5 else ''
-        heading += 'S' if abs(t.rotation.yaw) > 90.5 else ''
-        heading += 'E' if 179.5 > t.rotation.yaw > 0.5 else ''
-        heading += 'W' if -0.5 > t.rotation.yaw > -179.5 else ''
-        colhist = world.collision_sensor.get_collision_history()
-        collision = [colhist[x + self.frame - 200] for x in range(0, 200)]
-        max_col = max(1.0, max(collision))
-        collision = [x / max_col for x in collision]
-        vehicles = world.world.get_actors().filter('vehicle.*')
+        
+        # Calculate speed in km/h
+        speed_kmh = 3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)
+
+        # Get physics control for max_rpm
+        physics_control = world.player.get_physics_control()
+        current_rpm = 0
+        if isinstance(c, carla.VehicleControl) and physics_control:
+            if c.throttle > 0.01:
+                current_rpm = int(c.throttle * physics_control.max_rpm)
+                current_rpm = min(current_rpm, physics_control.max_rpm)
+            elif speed_kmh > 0.1:
+                current_rpm = int((speed_kmh / 200.0) * (physics_control.max_rpm / 2))
+                current_rpm = min(current_rpm, physics_control.max_rpm)
+            else:
+                current_rpm = 0
+
+        # Get total collision and lane invasion counts
+        total_collisions = world.collision_sensor.get_col_count()
+        total_lane_violations = world.lane_invasion_sensor.get_invasion_count()
+
+        # Update info text displayed on the left side
         self._info_text = [
-            'Server:  % 16.0f FPS' % self.server_fps,
-            'Client:  % 16.0f FPS' % clock.get_fps(),
-            '',
-            'Vehicle: % 20s' % get_actor_display_name(world.player, truncate=20),
-            'Map:     % 20s' % world.world.get_map().name.split('/')[-1],
-            'Simulation time: % 12s' % datetime.timedelta(seconds=int(self.simulation_time)),
-            '',
-            'Speed:   % 15.0f km/h' % (3.6 * math.sqrt(v.x**2 + v.y**2 + v.z**2)),
-            u'Heading:% 16.0f\N{DEGREE SIGN} % 2s' % (t.rotation.yaw, heading),
-            'Location:% 20s' % ('(% 5.1f, % 5.1f)' % (t.location.x, t.location.y)),
-            'GNSS:% 24s' % ('(% 2.6f, % 3.6f)' % (world.gnss_sensor.lat, world.gnss_sensor.lon)),
-            'Height:  % 18.0f m' % t.location.z,
-            '']
-        if isinstance(c, carla.VehicleControl):
-            self._info_text += [
-                ('Throttle:', c.throttle, 0.0, 1.0),
-                ('Steer:', c.steer, -1.0, 1.0),
-                ('Brake:', c.brake, 0.0, 1.0),
-                ('Reverse:', c.reverse),
-                ('Hand brake:', c.hand_brake),
-                ('Manual:', c.manual_gear_shift),
-                'Gear:        %s' % {-1: 'R', 0: 'N'}.get(c.gear, c.gear)]
-        elif isinstance(c, carla.WalkerControl):
-            self._info_text += [
-                ('Speed:', c.speed, 0.0, 5.556),
-                ('Jump:', c.jump)]
-        self._info_text += [
-            '',
-            'Collision:',
-            collision,
-            '',
-            'Number of vehicles: % 8d' % len(vehicles)]
-        if len(vehicles) > 1:
-            self._info_text += ['Nearby vehicles:']
-            distance = lambda l: math.sqrt((l.x - t.location.x)**2 + (l.y - t.location.y)**2 + (l.z - t.location.z)**2)
-            vehicles = [(distance(x.get_location()), x) for x in vehicles if x.id != world.player.id]
-            for d, vehicle in sorted(vehicles):
-                if d > 200.0:
-                    break
-                vehicle_type = get_actor_display_name(vehicle, truncate=22)
-                self._info_text.append('% 4dm %s' % (d, vehicle_type))
+            'SPEED:   % 10.0f KM/H' % speed_kmh,
+            'RPM:     % 10.0f' % current_rpm,
+            'GEAR:    % 10s' % ({-1: 'R', 0: 'N'}.get(c.gear, str(c.gear))),
+            '', # Spacer
+            'Total Collisions: % 8d' % total_collisions,
+            'Total Lane Violations: % 8d' % total_lane_violations,
+            '' # Spacer for consistency
+        ]
+        
+        # Warning Logic - Using critical_alert for main pop-ups
+        # Check for excessive speed warning (still uses frame-based cooldown as it's a continuous state)
+        if speed_kmh > 120:
+            if self.frame > self._last_speed_warning_frame_warned + 60: # Cooldown of 1 second (60 frames)
+                self.critical_alert("EXCESSIVE SPEED!", seconds=3.0)
+                self._last_speed_warning_frame_warned = self.frame
+        else:
+            # If speed drops below threshold, reset cooldown for speed warning
+            self._last_speed_warning_frame_warned = -1 
+            # Note: BlinkingAlert will fade out on its own if not re-triggered
+
+
+        # Check for new collision events (triggers only when total count increases)
+        # CollisionSensor._on_collision now directly calls self.hud.critical_alert
+        # So, we only need to update the _last_collision_count_warned here if that's still desired for a separate warning logic,
+        # otherwise, this block is mostly for HUD display.
+        # The immediate trigger is from the sensor's callback.
+        if total_collisions > self._last_collision_count_warned:
+            # The critical_alert would have been called by the sensor already.
+            # We just update the internal state for future comparisons here.
+            self._last_collision_count_warned = total_collisions
+        
+        # Check for new lane invasion events (triggers only when total count increases AND cooldown)
+        # LaneInvasionSensor._on_invasion now directly calls self.hud.critical_alert
+        # So, we only need to update the _last_lane_invasion_count_warned here if that's still desired for a separate warning logic.
+        if total_lane_violations > self._last_lane_invasion_count_warned:
+            # Only show notification if enough time has passed since the last lane violation notification
+            if self.frame > self._last_lane_invasion_frame_warned + 60: # Cooldown of 1 second (60 frames)
+                self.critical_alert("LANE VIOLATION!", seconds=3.0)
+                self._last_lane_invasion_count_warned = total_lane_violations # Update the count for comparison
+                self._last_lane_invasion_frame_warned = self.frame # Update the frame for cooldown
 
     def toggle_info(self):
         self._show_info = not self._show_info
 
-    def notification(self, text, seconds=2.0):
-        self._notifications.set_text(text, seconds=seconds)
+    def critical_alert(self, text, seconds=2.0, text_color=(255, 255, 255), symbol_color=(255, 255, 0)):
+        """Displays a critical, blinking, bouncing alert in the center."""
+        self._blinking_alert.set_text(text, text_color=text_color, seconds=seconds,
+                                    symbol_enabled=True, symbol_color=symbol_color)
+        if self.alert_sound:
+            self.alert_sound.play()
+
+    def notification(self, text, seconds=2.0, text_color=(255,255,255)):
+        """Displays a general informational notification (no symbol, no blinking, small)."""
+        # This will use BlinkingAlert but configured to look like a simple notification
+        self._blinking_alert.set_text(text, text_color=text_color, seconds=seconds,
+                                    symbol_enabled=False) # No symbol for general notification
 
     def error(self, text):
-        self._notifications.set_text('Error: %s' % text, (255, 0, 0))
+        """Displays a prominent error message."""
+        self._blinking_alert.set_text('ERROR: %s' % text.upper(),
+                                    text_color=(255, 0, 0), # Red text for error
+                                    seconds=5.0, # Stay on screen longer
+                                    symbol_enabled=True, symbol_color=(255, 0, 0)) # Red symbol for error
+        if self.alert_sound:
+            self.alert_sound.play()
 
     def render(self, display):
         if self._show_info:
@@ -616,63 +671,112 @@ class HUD(object):
                     surface = self._font_mono.render(item, True, (255, 255, 255))
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
-        self._notifications.render(display)
+        
+        self._blinking_alert.render(display) # Render the blinking alert
+        self._persistent_warning.render(display) # Render the persistent warning
         self.help.render(display)
 
-
 # +------------------------------------------------------------------------------+
-# | FadingText Class                                                             |
+# | BlinkingAlert Class (MODIFIED from FadingText)                               |
 # +------------------------------------------------------------------------------+
 
-class FadingText(object):
+class BlinkingAlert(object): # Renamed from FadingText
     def __init__(self, font, dim, pos):
         self.font = font
-        self.dim = dim
-        self.pos = pos
+        self.dim = dim # Screen dimensions
+        self.initial_pos = pos # Center position (calculated by HUD)
+        self.current_pos = list(pos) # Use list for mutable position
         self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-        self.start_time = 0.0 #To track when the notification started
-        self.duration = 0.0 # How long the notification should stay
+        self.surface = pygame.Surface(self.dim, pygame.SRCALPHA) # Main transparent surface
+        self.text_render_surface = pygame.Surface(self.dim, pygame.SRCALPHA) # Surface to render symbol + text
+        self.start_time = 0.0
+        self.duration = 0.0
+        self.text = "" # Store text for comparison
 
-    """def set_text(self, text, color=(255, 255, 255), seconds=2.0):
-        text_texture = self.font.render(text, True, color)
-        self.surface = pygame.Surface(self.dim)
+        # Animation parameters
+        self.blink_frequency = 5.0 # Cycles per second for blinking
+        self.bounce_height = 50.0  # Pixels to bounce up/down
+        self.bounce_frequency = 2.0 # Bounces per second
+        self.num_bounces = 3      # How many bounces before settling
+
+        # Font for symbol, larger
+        self.symbol_font = pygame.font.Font(pygame.font.get_default_font(), 40) # Even larger for middle alert
+
+    def set_text(self, text, text_color=(255, 255, 255), seconds=2.0, symbol_enabled=True, symbol_color=(255, 255, 0)): # Added symbol_enabled
+        # If the same alert is triggered again before it fades, reset its timer and re-render
+        if self.text == text and self.seconds_left > 0:
+            self.seconds_left = seconds # Reset timer
+            self.start_time = pygame.time.get_ticks() / 1000.0
+            self.current_pos = list(self.initial_pos) # Reset bounce
+            return
+
+        self.text = text # Store the text
         self.seconds_left = seconds
-        self.surface.fill((0, 0, 0, 0))
-        self.surface.blit(text_texture, (10, 11))
-        """
-    def set_text(self, text, color=(255, 255, 255), seconds=2.0):
-        text_texture = self.font.render(text, True, color)
-        self.surface = pygame.Surface(self.dim, pygame.SRCALPHA) # Add SRCALPHA for transparency
-        self.seconds_left = seconds
-        self.surface.fill((0, 0, 0, 0))
-        self.start_time = pygame.time.get_ticks() / 1000.0 #Time in seconds
+        self.start_time = pygame.time.get_ticks() / 1000.0
         self.duration = seconds
-        
-        # Calculate text position within its own surface to center it
-        text_x = (self.dim[0] - text_texture.get_width()) // 2
-        text_y = (self.dim[1] - text_texture.get_height()) // 2
-        self.surface.blit(text_texture, (text_x, text_y))
+        self.current_pos = list(self.initial_pos) # Reset position for new alert
+
+        # Clear previous text_render_surface
+        self.text_render_surface.fill((0, 0, 0, 0))
+
+        # Render symbol
+        symbol_texture = None
+        if symbol_enabled: # Only render symbol if enabled
+            symbol_text = "⚠" # Unicode WARNING SIGN (triangle with exclamation)
+            symbol_texture = self.symbol_font.render(symbol_text, True, symbol_color)
+
+        # Render main text (uppercase)
+        display_text = text.upper()
+        text_texture = self.font.render(display_text, True, text_color)
+
+        # Calculate total width for combined content
+        total_content_width = text_texture.get_width()
+        if symbol_texture:
+            total_content_width += symbol_texture.get_width() + 10 # Add spacing for symbol
+
+        total_content_height = max(symbol_texture.get_height() if symbol_texture else 0, text_texture.get_height())
+
+        # Determine blitting positions within the text_render_surface
+        blit_x_offset = (self.dim[0] - total_content_width) // 2 # Center horizontally on screen width
+        symbol_y_offset = (self.dim[1] - (symbol_texture.get_height() if symbol_texture else 0)) // 2
+        text_y_offset = (self.dim[1] - text_texture.get_height()) // 2
+
+
+        current_blit_x = blit_x_offset
+        if symbol_texture:
+            self.text_render_surface.blit(symbol_texture, (current_blit_x, symbol_y_offset))
+            current_blit_x += symbol_texture.get_width() + 10
+
+        self.text_render_surface.blit(text_texture, (current_blit_x, text_y_offset))
+
 
     def tick(self, _, clock):
         delta_seconds = 1e-3 * clock.get_time()
         self.seconds_left = max(0.0, self.seconds_left - delta_seconds)
-        #self.surface.set_alpha(500.0 * self.seconds_left)
-        if self.seconds_left > 0 :
+
+        if self.seconds_left > 0:
             elapsed_time = (pygame.time.get_ticks() / 1000.0) - self.start_time
-            #Blinking frequency (e.g. , 5 Hz, meaning 5 full cycles per second)
-            blink_frequency = 15.0
-            # Alpha oscillates between 0 (fully transparent) and 255 (fully opaque)
-            alpha = int(abs(math.sin(elapsed_time * math.pi * blink_frequency))* 255)
-            self.surface.set_alpha(alpha)
+
+            # Blinking (Alpha oscillation)
+            alpha = int(abs(math.sin(elapsed_time * math.pi * self.blink_frequency)) * 255)
+            self.surface.set_alpha(alpha) # Apply alpha to the main surface
+
+            # Bouncing animation
+            # Only bounce for a certain number of cycles at the beginning
+            if elapsed_time < self.num_bounces / self.bounce_frequency:
+                bounce_offset_y = self.bounce_height * (0.5 * (1 - math.cos(elapsed_time * math.pi * self.bounce_frequency * 2)))
+                self.current_pos[1] = self.initial_pos[1] - bounce_offset_y
+            else:
+                self.current_pos[1] = self.initial_pos[1] # Settle after bounces
         else:
-            self.surface.set_alpha(0)
-        
-        
+            self.surface.set_alpha(0) # Fully transparent when time is up
 
     def render(self, display):
-        display.blit(self.surface, self.pos)
-
+        if self.seconds_left > 0:
+            self.surface.blit(self.text_render_surface, (0, 0)) # Blit with its own internal positioning
+            display.blit(self.surface, self.current_pos) # Blit the final surface with its blinking/bouncing properties
+            
+            
 # +------------------------------------------------------------------------------+
 # | HelpText Class                                                               |
 # +------------------------------------------------------------------------------+
@@ -699,8 +803,72 @@ class HelpText(object):
         if self._render:
             display.blit(self.surface, self.pos)
 
+
+
+
 # +------------------------------------------------------------------------------+
-# | CollisionSensor Class                                                        |
+# | PersistentWarning Class                                                      |
+# +------------------------------------------------------------------------------+
+
+class PersistentWarning(object):
+    def __init__(self, font, dim, pos):
+        self.font = font
+        self.dim = dim # Expected to be screen dimensions
+        self.pos = pos # Position for top-right corner, will be calculated by HUD
+        self.text_surface = None
+        self.background_color = (60, 60, 0, 150)  # Dark yellow/orange with transparency
+        self.text_color = (255, 255, 255) # White text
+        self.symbol_color = (255, 255, 0) # Bright yellow symbol
+        self.is_active = False # Flag to show/hide the warning
+
+        # Font for the symbol, larger than main text
+        self.symbol_font = pygame.font.Font(pygame.font.get_default_font(), 24)
+
+    def set_warning_status(self, text="", active=False):
+        self.is_active = active
+        if self.is_active:
+            # Render symbol
+            symbol_text = "⚠"
+            symbol_texture = self.symbol_font.render(symbol_text, True, self.symbol_color)
+
+            # Render text (uppercase as common for warnings)
+            display_text = text.upper()
+            text_texture = self.font.render(display_text, True, self.text_color)
+
+            # Calculate total width for combined content
+            total_content_width = symbol_texture.get_width() + 10 + text_texture.get_width() # Symbol + gap + text
+            total_content_height = max(symbol_texture.get_height(), text_texture.get_height()) # Max height
+
+            # Create surface for the combined warning with transparency
+            self.text_surface = pygame.Surface((total_content_width + 20, total_content_height + 10), pygame.SRCALPHA) # Add padding
+            self.text_surface.fill(self.background_color) # Fill with background color
+
+            # Blit symbol and text onto this surface
+            current_x_pos = 10 # Padding from left edge
+            symbol_y_pos = (self.text_surface.get_height() - symbol_texture.get_height()) // 2
+            text_y_pos = (self.text_surface.get_height() - text_texture.get_height()) // 2
+
+            self.text_surface.blit(symbol_texture, (current_x_pos, symbol_y_pos))
+            current_x_pos += symbol_texture.get_width() + 10
+
+            self.text_surface.blit(text_texture, (current_x_pos, text_y_pos))
+        else:
+            self.text_surface = None # Clear surface when not active
+
+    def tick(self, world, clock):
+        # No complex animation needed for persistent, just update if content changes.
+        # This method is primarily here to match HUD's tick expectations.
+        pass
+
+    def render(self, display):
+        if self.is_active and self.text_surface:
+            # Position it in the top-right corner
+            render_pos_x = self.dim[0] - self.text_surface.get_width() - 10 # 10 pixel padding from right
+            render_pos_y = 10 # 10 pixel padding from top
+            display.blit(self.text_surface, (render_pos_x, render_pos_y))
+
+# +------------------------------------------------------------------------------+
+# | CollisionSensor Class (MODIFIED)                                             |
 # +------------------------------------------------------------------------------+
 
 
@@ -718,11 +886,19 @@ class CollisionSensor(object):
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda event: CollisionSensor._on_collision(weak_self, event))
 
+        # ADDED: Initialize collision count for HUD
+        self.history_count = 0 
+
+
     def get_collision_history(self):
         history = collections.defaultdict(int)
         for frame, intensity in self.history:
             history[frame] += intensity
         return history
+
+    # ADDED: Method to get the total collision count for HUD
+    def get_col_count(self):
+        return self.history_count
 
     @staticmethod
     def _on_collision(weak_self, event):
@@ -730,15 +906,21 @@ class CollisionSensor(object):
         if not self:
             return
         actor_type = get_actor_display_name(event.other_actor)
-        self.hud.notification('Collision with %r' % actor_type)
+        # MODIFIED: Use the HUD's critical_alert for collision notification
+        self.hud.critical_alert('Collision with %r' % actor_type, seconds=2.0)
         impulse = event.normal_impulse
         intensity = math.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
         self.history.append((event.frame, intensity))
         if len(self.history) > 4000:
             self.history.pop(0)
 
+        # MODIFIED: Increment history_count here directly on event
+        self.history_count += 1 
+
+
+
 # +------------------------------------------------------------------------------+
-# | LaneInvasionSensor Class                                                     |
+# | LaneInvasionSensor Class (MODIFIED)                                          |
 # +------------------------------------------------------------------------------+
 
 
@@ -755,6 +937,13 @@ class LaneInvasionSensor(object):
         weak_self = weakref.ref(self)
         self.sensor.listen(lambda event: LaneInvasionSensor._on_invasion(weak_self, event))
 
+        # ADDED: Initialize lane invasion count for HUD
+        self.history_count = 0 
+
+    # ADDED: Method to get the total lane invasion count for HUD
+    def get_invasion_count(self):
+        return self.history_count
+
     @staticmethod
     def _on_invasion(weak_self, event):
         self = weak_self()
@@ -762,7 +951,11 @@ class LaneInvasionSensor(object):
             return
         lane_types = set(x.type for x in event.crossed_lane_markings)
         text = ['%r' % str(x).split()[-1] for x in lane_types]
-        self.hud.notification('Crossed line %s' % ' and '.join(text))
+        # MODIFIED: Use the HUD's critical_alert for lane invasion notification
+        self.hud.critical_alert('Crossed line %s' % ' and '.join(text), seconds=2.0)
+
+        # MODIFIED: Increment history_count here directly on event
+        self.history_count += 1 
 
 # +------------------------------------------------------------------------------+
 # | GnssSensor Class                                                             |
@@ -823,6 +1016,7 @@ class CameraManager(object):
             if item[0].startswith('sensor.camera'):
                 bp.set_attribute('image_size_x', str(hud.dim[0]))
                 bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('fov', '90') # Example: Set FOV for camera sensor
             elif item[0].startswith('sensor.lidar'):
                 bp.set_attribute('range', '50')
             item.append(bp)
@@ -966,6 +1160,15 @@ def main():
         metavar='PATTERN',
         default='vehicle.*',
         help='actor filter (default: "vehicle.*")')
+    argparser.add_argument(
+        '--carla-root', # ADDED: Argument for CARLA root path
+        metavar='PATH',
+        default=os.environ.get('CARLA_ROOT', ''), # Use CARLA_ROOT env var if set
+        help='Path to CARLA installation directory (e.g., /opt/carla-simulator/ or C:\\carla)')
+    argparser.add_argument(
+        '--no-launch-carla', # ADDED: Argument to prevent launching CARLA server
+        action='store_true',
+        help='Do not launch CARLA server, assume it is already running.')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
@@ -977,69 +1180,62 @@ def main():
 
     print(__doc__)
 
+    global carla_server_process # Declare that we are using the global variable
+
     try:
+        # ADDED: Logic to launch CARLA server
+        if not args.no_launch_carla:
+            if not args.carla_root:
+                logging.error("CARLA_ROOT path is not provided via --carla-root or CARLA_ROOT environment variable.")
+                sys.exit(1)
+
+            # Determine CARLA server executable path based on OS
+            if sys.platform == 'win32':
+                carla_server_executable = os.path.join(args.carla_root, 'WindowsNoEditor', 'CarlaUE4.exe')
+                command = [carla_server_executable, f'-carla-rpc-port={args.port}']
+            elif sys.platform.startswith('linux'):
+                carla_server_executable = os.path.join(args.carla_root, 'CarlaUE4.sh')
+                command = [carla_server_executable, f'--carla-rpc-port={args.port}']
+            else:
+                logging.error(f"Unsupported OS: {sys.platform}")
+                sys.exit(1)
+
+            if not os.path.exists(carla_server_executable):
+                logging.error(f"CARLA server executable not found at: {carla_server_executable}")
+                logging.error("Please provide the correct path to your CARLA installation root using --carla-root.")
+                sys.exit(1)
+
+            logging.info(f"Launching CARLA server: {' '.join(command)}")
+            # Start the CARLA server as a subprocess
+            carla_server_process = subprocess.Popen(command)
+
+            logging.info("Waiting for CARLA server to start...")
+            time.sleep(5) # Adjust this delay as needed based on your system's performance
+            
+            # Optional: More robust wait for server readiness (e.g., try connecting in a loop)
 
         game_loop(args)
 
     except KeyboardInterrupt:
         print('\nCancelled by user. Bye!')
-
+    except Exception as e: # Catch broader exceptions for better error handling
+        logging.error(f"An unexpected error occurred: {e}", exc_info=True) # exc_info=True to print traceback
     finally:
-        # Added explicit check for world and player existence before destroy
-        if world is not None:
-            if world.player is not None:
-                # Destroy player explicitly if it exists
-                world.player.destroy()
-                world.player = None
-            # Destroy other world objects if necessary
-            # world.destroy() # World destroy might be called by World class __del__ or similar
-
+        # ADDED: Logic to terminate CARLA server
+        if carla_server_process is not None:
+            logging.info("Terminating CARLA server process...")
+            carla_server_process.terminate() # Send SIGTERM
+            try:
+                carla_server_process.wait(timeout=5) # Wait for it to terminate
+            except subprocess.TimeoutExpired:
+                logging.warning("CARLA server did not terminate gracefully, forcing kill.")
+                carla_server_process.kill() # Force kill if it doesn't terminate
+            logging.info("CARLA server process terminated.")
+        
+        # Original finally block already handles pygame.quit()
         pygame.quit()
 
-        
-
-# -- run ---------------
 
 if __name__ == '__main__':
 
     main()
-
-
-# +------------------------------------------------------------------------------+
-# | End Script - Detailed Overview and Notes Below                               |
-# +------------------------------------------------------------------------------+
-
-"""
-Detailed Script Overview: 
-
-System Hardware Setup: Ryzen 5 5600G, MSI NVIDIA RTX 3060 Ti (8GB) Ventus 2x OC, 32 GB G.Skill Ripjaw V @2133 mhz, (primary drive) Inland 1TB Gen 3x4 3D NAND M.2 NVMe SSD, ASRock B450m Pro4.
-
-Controller Input Tested:
-Brand: Fanatec CSL series [base] CSL-DD-QR2 [wheel] CSL-SW P1 V2 Steering Wheel [pedal] CSL Pedals (2-pedal base model)
-
-
-Descriptions:
-Pygame, the carla python package and additional value transformations are utilized to integrate Fanatec simulation hardware (model: CSL-DD/PD, Wheel and Pedal).
-
-This script is a partial integration and modification of existing CARLA packaged script
-This script integrates Fanatec DD-CSL/PD (wheel and pedal hardware kit) input, transforming data read using pygame. To drive start by pressing the brake pedal
-Configure steering wheel, pedals, and buttons by setting the index variables in the DualControl class based on the output of
-the joystick_input_finder.py script.
-
-Important Note: 
-Each hardware configuration _**may**_  be unique. (SEE SECTION STARTING LINE 236 FOR HARDCODING OF MAPPED INPUTS)
-There are many axes, buttons and hats recognized by pygame, many of which are not relevant or produce irrelevant data. Each system must be manually configured using the additional fanatec_mapping script included in the 'FANATEC' folder.
-
-Key Areas to work on:
-- Synchronous Mode. Really important for precision and there have been many problems applying that in particular despite extended timeouts.
-- Vehicle Model/Type. Each model is unique, has unique dimensions. Hoping this script maintains adaptability but that's to be seen.
-- Utilization of Buttons for specific functions (paddle shifters, handbrake, etc.)
-
-Further Work, To-Do: \n
-- Test on other aspect ratios (notably DQHD - 5120x1440 - for 49" Samsung Odyssey). Running at 1280x720 or less now
-- Create dynamic mapping scripts for any hardware config. for Windows AND Linux
-- AUDIO! The PC has no audio output, it throws up a number of flags in the log
-- Test it.....
-
-"""
-#        (┛ಠ_ಠ)┛彡┻━┻#                      This is being ported to Linux ASAP                       ┻━┻ ︵╰(°□°╰)
